@@ -11,12 +11,12 @@ class DetectorConfig:
     radius: int = 14
     lookahead_px: int = 150
     behind_px: int = 24
-    min_pixel_delta: float = 26.0
+    min_pixel_delta: float = 22.0
     noise_multiplier: float = 6.0
-    column_occupancy: float = 0.14
-    circle_occupancy: float = 0.055
-    clear_occupancy: float = 0.025
-    lead_time_s: float = 0.060
+    column_occupancy: float = 0.06
+    circle_occupancy: float = 0.020
+    clear_occupancy: float = 0.010
+    lead_time_s: float = 0.070
     min_speed_px_s: float = 120.0
     max_speed_px_s: float = 2200.0
     speed_alpha: float = 0.24
@@ -176,17 +176,30 @@ class AutoJumpDetector:
         )
 
     def _update_speed(self, edge_x: float, timestamp: float) -> None:
-        if self.prev_edge_x is not None and self.prev_edge_t is not None:
-            dt = timestamp - self.prev_edge_t
-            dx = self.prev_edge_x - edge_x  # positive for right-to-left motion
-            if 0.001 <= dt <= 0.100 and dx > 0:
-                instant = dx / dt
-                if self.config.min_speed_px_s <= instant <= self.config.max_speed_px_s:
-                    if self.speed_px_s <= 0:
-                        self.speed_px_s = instant
-                    else:
-                        a = self.config.speed_alpha
-                        self.speed_px_s = (1.0 - a) * self.speed_px_s + a * instant
+        if self.prev_edge_x is None or self.prev_edge_t is None:
+            self.prev_edge_x = edge_x
+            self.prev_edge_t = timestamp
+            return
+
+        dt = timestamp - self.prev_edge_t
+        dx = self.prev_edge_x - edge_x  # positive for right-to-left motion
+
+        # At high capture rates an edge often remains on the same integer pixel
+        # for several frames. Keep the old timestamp until it actually moves;
+        # otherwise a 1-pixel move gets divided by only the last tiny frame dt
+        # and produces a bogus speed spike that is rejected as out of range.
+        if dx == 0 and dt <= 0.100:
+            return
+
+        if 0.001 <= dt <= 0.150 and dx > 0:
+            instant = dx / dt
+            if self.config.min_speed_px_s <= instant <= self.config.max_speed_px_s:
+                if self.speed_px_s <= 0:
+                    self.speed_px_s = instant
+                else:
+                    a = self.config.speed_alpha
+                    self.speed_px_s = (1.0 - a) * self.speed_px_s + a * instant
+
         self.prev_edge_x = edge_x
         self.prev_edge_t = timestamp
 

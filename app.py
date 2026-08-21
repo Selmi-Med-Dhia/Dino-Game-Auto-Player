@@ -5,33 +5,69 @@ import queue
 import sys
 import threading
 import time
+
+
+def enable_dpi_awareness() -> str:
+    """Keep Tk/pynput coordinates aligned with MSS physical screen pixels."""
+    if sys.platform != "win32":
+        return "not-windows"
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except (AttributeError, OSError):
+        pass
+    try:
+        # This is the workaround recommended by pynput for Windows scaling.
+        result = ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        if result in (0, -2147024891):  # S_OK or already configured
+            return "per-monitor"
+    except (AttributeError, OSError):
+        pass
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except (AttributeError, OSError):
+        pass
+    return "unknown"
+
+
+DPI_MODE = enable_dpi_awareness()  # Must happen before Tk creates a window.
+
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-import mss
 import numpy as np
-from pynput import keyboard, mouse
+from mss import MSS
+from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 from pynput.mouse import Button, Controller as MouseController
 
 from detector import AutoJumpDetector, DetectorConfig
 
-
 APP_TITLE = "Dino Auto-Player"
 STOP_KEY = keyboard.Key.f8
 
 
-class SensorOverlay:
-    """Small click-through circle marking the selected detection point."""
+class WinPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
+
+def physical_cursor_pos(fallback_x: int, fallback_y: int) -> tuple[int, int]:
+    """Use physical coordinates even if Windows still applies DPI virtualization."""
+    if sys.platform == "win32":
+        try:
+            p = WinPoint()
+            if ctypes.windll.user32.GetPhysicalCursorPos(ctypes.byref(p)):
+                return int(p.x), int(p.y)
+        except (AttributeError, OSError):
+            pass
+    return int(fallback_x), int(fallback_y)
+
+
+class Marker:
     def __init__(self, root: tk.Tk, x: int, y: int, radius: int):
-        self.root = root
-        self.x = x
-        self.y = y
         self.radius = radius
-        self.size = radius * 2 + 18
-        self.capture_excluded = False
-
+        size = radius * 2 + 18
         self.window = tk.Toplevel(root)
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
@@ -40,47 +76,33 @@ class SensorOverlay:
             self.window.wm_attributes("-transparentcolor", "#ff00ff")
         except tk.TclError:
             pass
-        left = x - self.size // 2
-        top = y - self.size // 2
-        self.window.geometry(f"{self.size}x{self.size}{left:+d}{top:+d}")
-
-        canvas = tk.Canvas(self.window, width=self.size, height=self.size, bg="#ff00ff", highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
+        self.window.geometry(f"{size}x{size}{x - size // 2:+d}{y - size // 2:+d}")
+        canvas = tk.Canvas(self.window, width=size, height=size, bg="#ff00ff", highlightthickness=0)
+        canvas.pack()
         pad = 7
-        canvas.create_oval(pad, pad, self.size - pad, self.size - pad, outline="#00d8ff", width=3)
-        canvas.create_line(self.size // 2, 2, self.size // 2, 10, fill="#00d8ff", width=2)
-        canvas.create_line(self.size - 10, self.size // 2, self.size - 2, self.size // 2, fill="#00d8ff", width=2)
-        canvas.create_line(self.size // 2, self.size - 10, self.size // 2, self.size - 2, fill="#00d8ff", width=2)
-        canvas.create_line(2, self.size // 2, 10, self.size // 2, fill="#00d8ff", width=2)
-
+        canvas.create_oval(pad, pad, size - pad, size - pad, outline="#00d8ff", width=3)
+        canvas.create_line(size // 2 - 5, size // 2, size // 2 + 5, size // 2, fill="#00d8ff", width=2)
+        canvas.create_line(size // 2, size // 2 - 5, size // 2, size // 2 + 5, fill="#00d8ff", width=2)
         self.window.update_idletasks()
-        self._make_click_through_and_capture_safe()
+        self._make_click_through()
 
-    def _make_click_through_and_capture_safe(self) -> None:
+    def _make_click_through(self) -> None:
         if sys.platform != "win32":
             return
         try:
             hwnd = self.window.winfo_id()
             user32 = ctypes.windll.user32
-            GWL_EXSTYLE = -20
-            WS_EX_TRANSPARENT = 0x00000020
-            WS_EX_LAYERED = 0x00080000
-            WS_EX_TOOLWINDOW = 0x00000080
-            WS_EX_NOACTIVATE = 0x08000000
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-
-            # Windows 10 2004+: keep our marker out of Desktop Duplication / screenshots.
-            WDA_EXCLUDEFROMCAPTURE = 0x00000011
-            self.capture_excluded = bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+            style = user32.GetWindowLongW(hwnd, -20)
+            # Transparent + layered + toolwindow + no-activate.
+            user32.SetWindowLongW(hwnd, -20, style | 0x20 | 0x80000 | 0x80 | 0x08000000)
         except Exception:
-            self.capture_excluded = False
-
-    def show(self) -> None:
-        self.window.deiconify()
+            pass
 
     def hide(self) -> None:
         self.window.withdraw()
+
+    def show(self) -> None:
+        self.window.deiconify()
 
     def destroy(self) -> None:
         try:
@@ -90,54 +112,45 @@ class SensorOverlay:
 
 
 class PointSelector:
-    def __init__(self, root: tk.Tk, callback, cancel_callback=None):
+    def __init__(self, root: tk.Tk, on_select, on_cancel):
         self.root = root
-        self.callback = callback
-        self.cancel_callback = cancel_callback
+        self.on_select = on_select
+        self.on_cancel = on_cancel
         self.overlay = tk.Toplevel(root)
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
         self.overlay.attributes("-alpha", 0.24)
-        self.overlay.configure(bg="black")
+        self.overlay.configure(bg="black", cursor="crosshair")
 
-        # Cover the whole virtual desktop on Windows, primary screen elsewhere.
         if sys.platform == "win32":
-            user32 = ctypes.windll.user32
-            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
-            SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
-            vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-            vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-            vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-            vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            u = ctypes.windll.user32
+            vx, vy = u.GetSystemMetrics(76), u.GetSystemMetrics(77)
+            vw, vh = u.GetSystemMetrics(78), u.GetSystemMetrics(79)
         else:
-            vx, vy = 0, 0
+            vx = vy = 0
             vw, vh = root.winfo_screenwidth(), root.winfo_screenheight()
-
-        self.vx, self.vy = vx, vy
         self.overlay.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
-        self.overlay.config(cursor="crosshair")
         self.overlay.bind("<Button-1>", self._clicked)
         self.overlay.bind("<Escape>", lambda _e: self.cancel())
-
-        self.label = tk.Label(
+        tk.Label(
             self.overlay,
-            text="Click the point where you want the cactus detector circle\n(Esc to cancel)",
+            text="Click an EMPTY point in front of the dinosaur at cactus-body height\n(Esc to cancel)",
             fg="white",
             bg="black",
             font=("Segoe UI", 18, "bold"),
             padx=20,
             pady=12,
-        )
-        self.label.place(relx=0.5, rely=0.08, anchor="n")
+        ).place(relx=0.5, rely=0.08, anchor="n")
         self.overlay.focus_force()
         self.overlay.grab_set()
 
     def _clicked(self, event: tk.Event) -> None:
-        x = self.overlay.winfo_rootx() + int(event.x)
-        y = self.overlay.winfo_rooty() + int(event.y)
+        logical_x = self.overlay.winfo_rootx() + int(event.x)
+        logical_y = self.overlay.winfo_rooty() + int(event.y)
+        x, y = physical_cursor_pos(logical_x, logical_y)
         self.overlay.grab_release()
         self.overlay.destroy()
-        self.callback(x, y)
+        self.on_select(x, y)
 
     def cancel(self) -> None:
         try:
@@ -145,21 +158,19 @@ class PointSelector:
         except tk.TclError:
             pass
         self.overlay.destroy()
-        if self.cancel_callback:
-            self.cancel_callback()
+        self.on_cancel()
 
 
 class DinoAutoPlayerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("520x430")
-        self.root.minsize(500, 410)
+        self.root.geometry("530x440")
+        self.root.minsize(500, 420)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.selected: tuple[int, int] | None = None
-        self.sensor_overlay: SensorOverlay | None = None
-        self.worker: threading.Thread | None = None
+        self.marker: Marker | None = None
         self.stop_event = threading.Event()
         self.running = False
         self.keyboard = KeyboardController()
@@ -167,16 +178,16 @@ class DinoAutoPlayerApp:
         self.listener = keyboard.Listener(on_press=self._global_key)
         self.listener.start()
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.jump_count = 0
 
         self.status_var = tk.StringVar(value="Choose a detector point to begin.")
         self.point_var = tk.StringVar(value="Not selected")
         self.speed_var = tk.StringVar(value="—")
         self.jump_var = tk.StringVar(value="0")
         self.occupancy_var = tk.StringVar(value="—")
-        self.lead_ms = tk.DoubleVar(value=60.0)
+        self.lead_ms = tk.DoubleVar(value=70.0)
         self.radius = tk.IntVar(value=14)
-        self.sensitivity = tk.DoubleVar(value=26.0)
-        self.jump_count = 0
+        self.sensitivity = tk.DoubleVar(value=22.0)
 
         self._build_ui()
         self.root.after(50, self._poll_messages)
@@ -188,61 +199,54 @@ class DinoAutoPlayerApp:
             style.theme_use("vista")
         except tk.TclError:
             pass
-
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
-
         ttk.Label(outer, text="Chrome Dino Auto-Player", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Select a blank point slightly in front of the dinosaur at cactus height. The app calibrates that local background and jumps when a contrasting obstacle approaches.",
-            wraplength=480,
-        ).pack(anchor="w", pady=(6, 16))
+            text="Select a blank point roughly 70–130 px in front of the dinosaur, at the middle of a cactus body. The app watches that physical screen location and predicts approaching obstacles.",
+            wraplength=490,
+        ).pack(anchor="w", pady=(6, 15))
 
-        info = ttk.LabelFrame(outer, text="Live status", padding=12)
+        info = ttk.LabelFrame(outer, text="Last telemetry", padding=12)
         info.pack(fill="x")
-        self._row(info, 0, "Detector point", self.point_var)
-        self._row(info, 1, "Estimated speed", self.speed_var)
-        self._row(info, 2, "Circle contrast", self.occupancy_var)
-        self._row(info, 3, "Jumps", self.jump_var)
+        for row, (name, var) in enumerate((
+            ("Detector point", self.point_var),
+            ("Estimated speed", self.speed_var),
+            ("Circle contrast", self.occupancy_var),
+            ("Automatic jumps", self.jump_var),
+        )):
+            ttk.Label(info, text=name).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Label(info, textvariable=var, font=("Segoe UI", 10, "bold")).grid(row=row, column=1, sticky="e", pady=2)
+        info.columnconfigure(1, weight=1)
 
         settings = ttk.LabelFrame(outer, text="Tuning", padding=12)
         settings.pack(fill="x", pady=12)
-
-        ttk.Label(settings, text="Predictive lead").grid(row=0, column=0, sticky="w")
-        ttk.Scale(settings, from_=25, to=110, variable=self.lead_ms, orient="horizontal").grid(row=0, column=1, sticky="ew", padx=10)
-        ttk.Label(settings, textvariable=self.lead_ms, width=6).grid(row=0, column=2, sticky="e")
-
-        ttk.Label(settings, text="Circle radius").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Scale(settings, from_=8, to=24, variable=self.radius, orient="horizontal").grid(row=1, column=1, sticky="ew", padx=10, pady=(8, 0))
-        ttk.Label(settings, textvariable=self.radius, width=6).grid(row=1, column=2, sticky="e", pady=(8, 0))
-
-        ttk.Label(settings, text="Min contrast").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Scale(settings, from_=14, to=55, variable=self.sensitivity, orient="horizontal").grid(row=2, column=1, sticky="ew", padx=10, pady=(8, 0))
-        ttk.Label(settings, textvariable=self.sensitivity, width=6).grid(row=2, column=2, sticky="e", pady=(8, 0))
+        rows = (
+            ("Predictive lead (ms)", self.lead_ms, 25, 130),
+            ("Circle radius", self.radius, 8, 24),
+            ("Min contrast", self.sensitivity, 12, 55),
+        )
+        for row, (name, var, low, high) in enumerate(rows):
+            ttk.Label(settings, text=name).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Scale(settings, from_=low, to=high, variable=var, orient="horizontal").grid(row=row, column=1, sticky="ew", padx=10, pady=3)
+            ttk.Label(settings, textvariable=var, width=7).grid(row=row, column=2, sticky="e")
         settings.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(outer)
-        buttons.pack(fill="x", pady=(2, 8))
+        buttons.pack(fill="x")
         self.select_btn = ttk.Button(buttons, text="Select point", command=self.select_point)
         self.select_btn.pack(side="left")
         self.start_btn = ttk.Button(buttons, text="Start autoplay", command=self.start)
         self.start_btn.pack(side="left", padx=8)
         self.stop_btn = ttk.Button(buttons, text="Stop (F8)", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left")
-
-        ttk.Label(outer, textvariable=self.status_var, wraplength=480).pack(anchor="w", pady=(8, 0))
-        ttk.Label(outer, text="Tip: if jumps are late at high speed, increase Predictive lead. If it jumps on noise, increase Min contrast.", wraplength=480).pack(anchor="w", pady=(8, 0))
-
-    @staticmethod
-    def _row(parent, row: int, label: str, variable: tk.StringVar) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-        ttk.Label(parent, textvariable=variable, font=("Segoe UI", 10, "bold")).grid(row=row, column=1, sticky="e", pady=2)
-        parent.columnconfigure(1, weight=1)
+        ttk.Label(outer, textvariable=self.status_var, wraplength=490).pack(anchor="w", pady=(12, 0))
 
     def select_point(self) -> None:
         if self.running:
             self.stop()
+            return
         self.root.withdraw()
         PointSelector(self.root, self._point_selected, self._selection_cancelled)
 
@@ -253,13 +257,13 @@ class DinoAutoPlayerApp:
 
     def _point_selected(self, x: int, y: int) -> None:
         self.selected = (x, y)
-        self.point_var.set(f"{x}, {y}")
-        if self.sensor_overlay:
-            self.sensor_overlay.destroy()
-        self.sensor_overlay = SensorOverlay(self.root, x, y, int(self.radius.get()))
+        self.point_var.set(f"{x}, {y} physical px")
+        if self.marker:
+            self.marker.destroy()
+        self.marker = Marker(self.root, x, y, int(self.radius.get()))
         self.root.deiconify()
         self.root.lift()
-        self.status_var.set("Point selected. Keep the detector circle on empty background, then click Start autoplay.")
+        self.status_var.set("Point selected. Leave the Dino game visible, then click Start autoplay.")
 
     def start(self) -> None:
         if self.running:
@@ -267,7 +271,6 @@ class DinoAutoPlayerApp:
         if not self.selected:
             self.select_point()
             return
-
         self.jump_count = 0
         self.jump_var.set("0")
         self.stop_event.clear()
@@ -275,74 +278,65 @@ class DinoAutoPlayerApp:
         self.start_btn.config(state="disabled")
         self.select_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status_var.set("Starting: focusing the game, calibrating clean background, then autoplaying…")
+        self.status_var.set("Running… press F8 to stop.")
 
-        # Hide the control window so it cannot overlap the capture area.
+        # Always hide our marker. Capture-exclusion APIs are not trusted here:
+        # a visible layered window can otherwise mask the cactus from GDI/MSS.
         self.root.withdraw()
-        if self.sensor_overlay and not self.sensor_overlay.capture_excluded:
-            # Fallback for Windows versions that cannot exclude a window from capture.
-            self.sensor_overlay.hide()
+        if self.marker:
+            self.marker.hide()
 
         settings = {
             "radius": int(self.radius.get()),
             "lead_ms": float(self.lead_ms.get()),
             "sensitivity": float(self.sensitivity.get()),
         }
-        self.worker = threading.Thread(target=self._run_detector, args=(settings,), daemon=True)
-        self.worker.start()
+        threading.Thread(target=self._run_detector, args=(settings,), daemon=True).start()
 
     def stop(self) -> None:
-        if not self.running:
-            return
-        self.stop_event.set()
-        self.stop_btn.config(state="disabled")
-        self.status_var.set("Stopping autoplay…")
+        if self.running:
+            self.stop_event.set()
 
-    def _restore_after_stop(self) -> None:
+    def _restore(self) -> None:
         self.root.deiconify()
         self.root.lift()
-        if self.sensor_overlay:
-            self.sensor_overlay.show()
+        if self.marker:
+            self.marker.show()
         self.start_btn.config(state="normal")
         self.select_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
-        self.status_var.set("Stopped. Adjust settings or restart. Press F8 at any time to stop autoplay.")
+        self.status_var.set("Stopped. Adjust settings or restart.")
 
     def _run_detector(self, settings: dict[str, float]) -> None:
         assert self.selected is not None
         x, y = self.selected
         radius = int(settings["radius"])
-        behind = max(24, radius + 8)
-        lookahead = 150
-        desired_height = max(34, radius * 2 + 8)
+        behind = max(32, radius + 12)
+        lookahead = 240
+        capture_h = max(48, radius * 2 + 18)
 
         try:
-            # Focus Chrome/game safely by clicking the point the user chose.
-            time.sleep(0.35)
+            # Let withdrawn Tk windows disappear completely, then focus the game.
+            time.sleep(0.18)
             self.mouse.position = (x, y)
             self.mouse.click(Button.left, 1)
             time.sleep(0.18)
 
-            with mss.mss() as sct:
-                # Clamp the capture rectangle to the virtual desktop so a point
-                # near a monitor edge does not make mss reject the grab.
+            with MSS() as sct:
                 virtual = sct.monitors[0]
-                vleft = int(virtual["left"])
-                vtop = int(virtual["top"])
+                vleft, vtop = int(virtual["left"]), int(virtual["top"])
                 vright = vleft + int(virtual["width"])
                 vbottom = vtop + int(virtual["height"])
-
                 left = max(vleft, x - behind)
                 right = min(vright, x + lookahead)
-                top = max(vtop, y - desired_height // 2)
-                bottom = min(vbottom, y + desired_height // 2)
-                width = right - left
-                height = bottom - top
-                if width < 8 or height < 8:
-                    raise RuntimeError("The selected point is too close to the desktop edge. Choose a point farther inside the screen.")
-                sensor_x = x - left
-                sensor_y = y - top
+                top = max(vtop, y - capture_h // 2)
+                bottom = min(vbottom, y + capture_h // 2)
+                width, height = right - left, bottom - top
+                if width < 16 or height < 16:
+                    raise RuntimeError("Detector point is too close to a desktop edge.")
 
+                sensor_x, sensor_y = x - left, y - top
+                region = {"left": left, "top": top, "width": width, "height": height}
                 config = DetectorConfig(
                     radius=min(radius, max(4, min(width, height) // 2 - 1)),
                     lookahead_px=lookahead,
@@ -351,19 +345,28 @@ class DinoAutoPlayerApp:
                     lead_time_s=float(settings["lead_ms"]) / 1000.0,
                 )
                 detector = AutoJumpDetector(width, height, sensor_x, sensor_y, config)
-                region = {"left": left, "top": top, "width": width, "height": height}
+                print(
+                    f"[Dino] DPI={DPI_MODE}; physical point=({x},{y}); "
+                    f"capture=({left},{top},{width}x{height}); sensor=({sensor_x},{sensor_y})",
+                    flush=True,
+                )
 
-                calibration = []
+                frames: list[np.ndarray] = []
                 deadline = time.perf_counter() + 0.38
                 while time.perf_counter() < deadline and not self.stop_event.is_set():
-                    calibration.append(self._grab_gray(sct, region))
+                    frames.append(self._grab_gray(sct, region))
                     time.sleep(0.012)
                 if self.stop_event.is_set():
                     return
-                detector.calibrate(calibration)
+                detector.calibrate(frames)
+                print(
+                    f"[Dino] calibration: {len(frames)} frames, threshold={detector.threshold:.1f}, "
+                    f"noise={detector.noise_level:.2f}",
+                    flush=True,
+                )
 
-                # Space starts/restarts the dinosaur game. If it is already
-                # running, this is simply an initial jump and autoplay continues.
+                # Start/restart the game. This initial press is not counted as an
+                # automatic cactus jump.
                 self.keyboard.press(keyboard.Key.space)
                 self.keyboard.release(keyboard.Key.space)
                 time.sleep(0.12)
@@ -371,21 +374,19 @@ class DinoAutoPlayerApp:
                 last_ui = 0.0
                 while not self.stop_event.is_set():
                     now = time.perf_counter()
-                    frame = self._grab_gray(sct, region)
-                    telemetry = detector.process(frame, now)
-
+                    telemetry = detector.process(self._grab_gray(sct, region), now)
                     if telemetry.should_jump:
                         self.keyboard.press(keyboard.Key.space)
                         self.keyboard.release(keyboard.Key.space)
                         self.jump_count += 1
-
+                        print(
+                            f"[Dino] JUMP #{self.jump_count}: distance={telemetry.obstacle_distance_px}, "
+                            f"speed={telemetry.speed_px_s:.0f}px/s, circle={telemetry.occupancy * 100:.1f}%",
+                            flush=True,
+                        )
                     if now - last_ui >= 0.10:
-                        speed = telemetry.speed_px_s
-                        occupancy_pct = telemetry.occupancy * 100.0
-                        self.messages.put(("live", (speed, occupancy_pct, self.jump_count)))
+                        self.messages.put(("live", (telemetry.speed_px_s, telemetry.occupancy, self.jump_count)))
                         last_ui = now
-
-                    # Cap around 120 Hz. mss is fast, and this keeps CPU usage sane.
                     time.sleep(0.004)
         except Exception as exc:
             self.messages.put(("error", str(exc)))
@@ -394,22 +395,12 @@ class DinoAutoPlayerApp:
             self.messages.put(("finished", None))
 
     @staticmethod
-    def _grab_gray(sct: mss.mss, region: dict[str, int]) -> np.ndarray:
+    def _grab_gray(sct, region: dict[str, int]) -> np.ndarray:
         shot = np.asarray(sct.grab(region), dtype=np.uint8)
-        # mss is BGRA; integer luma approximation avoids OpenCV dependency.
         b = shot[:, :, 0].astype(np.uint16)
         g = shot[:, :, 1].astype(np.uint16)
         r = shot[:, :, 2].astype(np.uint16)
-        gray = ((29 * b + 150 * g + 77 * r) >> 8).astype(np.uint8)
-        return gray
-
-    def _set_live_ui(self, speed: float, occupancy_pct: float, jumps: int) -> None:
-        self.speed_var.set(f"{speed:,.0f} px/s" if speed > 0 else "learning…")
-        self.occupancy_var.set(f"{occupancy_pct:.1f}%")
-        self.jump_var.set(str(jumps))
-
-    def _worker_error(self, message: str) -> None:
-        messagebox.showerror(APP_TITLE, f"Autoplay stopped because of an error:\n\n{message}")
+        return ((29 * b + 150 * g + 77 * r) >> 8).astype(np.uint8)
 
     def _global_key(self, key) -> None:
         if key == STOP_KEY:
@@ -421,14 +412,15 @@ class DinoAutoPlayerApp:
             while True:
                 kind, payload = self.messages.get_nowait()
                 if kind == "live":
-                    speed, occupancy_pct, jumps = payload
-                    self._set_live_ui(float(speed), float(occupancy_pct), int(jumps))
+                    speed, occupancy, jumps = payload
+                    self.speed_var.set(f"{float(speed):,.0f} px/s" if float(speed) > 0 else "learning…")
+                    self.occupancy_var.set(f"{float(occupancy) * 100:.1f}%")
+                    self.jump_var.set(str(jumps))
                 elif kind == "error":
-                    self._worker_error(str(payload))
-                elif kind in {"finished", "stop_requested"}:
-                    if self.running:
-                        self.running = False
-                        self._restore_after_stop()
+                    messagebox.showerror(APP_TITLE, f"Autoplay stopped:\n\n{payload}")
+                elif kind in {"finished", "stop_requested"} and self.running:
+                    self.running = False
+                    self._restore()
         except queue.Empty:
             pass
         try:
@@ -442,8 +434,8 @@ class DinoAutoPlayerApp:
             self.listener.stop()
         except Exception:
             pass
-        if self.sensor_overlay:
-            self.sensor_overlay.destroy()
+        if self.marker:
+            self.marker.destroy()
         self.root.destroy()
 
     def run(self) -> None:
