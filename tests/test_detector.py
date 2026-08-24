@@ -13,6 +13,12 @@ def make_detector(bg=255, **overrides):
         lead_time_s=0.060,
         cooldown_s=0.100,
         clear_hold_s=0.020,
+        sensor_ahead_px=0,
+        jump_air_time_s=0.12,
+        landing_margin_s=0.02,
+        cluster_gap_time_s=0.08,
+        cluster_gap_fallback_px=20,
+        min_entry_clearance_s=0.05,
     )
     values.update(overrides)
     cfg = DetectorConfig(**values)
@@ -54,39 +60,43 @@ def test_same_cactus_does_not_repeat_jump():
 
 
 def test_separate_cacti_can_trigger_twice_after_clear_gap():
-    d = make_detector(bg=255)
+    d = make_detector(bg=255, jump_air_time_s=0.10)
     obstacle = np.full((24, 120), 255, np.uint8)
     paint_obstacle(obstacle, 18, 25, 0)
     clear = np.full((24, 120), 255, np.uint8)
 
     assert d.process(obstacle, 1.00).should_jump
-    d.process(clear, 1.02)
-    d.process(clear, 1.05)  # clear long enough to rearm
-    assert d.process(obstacle, 1.20).should_jump
+    d.process(clear, 1.12)
+    d.process(clear, 1.15)
+    assert d.process(obstacle, 1.30).should_jump
 
 
-def test_speed_tracking_predicts_before_circle():
-    d = make_detector(bg=255, min_speed_px_s=100, max_speed_px_s=2000)
+def test_speed_tracking_uses_trailing_edge_landing_plan():
+    d = make_detector(
+        bg=255,
+        min_speed_px_s=100,
+        max_speed_px_s=2000,
+        jump_air_time_s=0.20,
+        landing_margin_s=0.02,
+    )
 
-    # Obstacle moves left 8 px every 20 ms = 400 px/s.
-    positions = [70, 62, 54, 46]
-    times = [1.00, 1.02, 1.04, 1.06]
-    telemetry = None
-    for x, t in zip(positions, times):
+    jumped = None
+    for x, t in [(90, 1.00), (82, 1.02), (74, 1.04), (66, 1.06), (58, 1.08)]:
         frame = np.full((24, 120), 255, np.uint8)
-        paint_obstacle(frame, x, x + 6, 0)
+        paint_obstacle(frame, x, x + 12, 0)
         telemetry = d.process(frame, t)
+        if telemetry.should_jump:
+            jumped = telemetry
+            break
 
-    assert telemetry is not None
-    assert 300 <= telemetry.speed_px_s <= 500
-    # At x=46, distance to sensor is 26 px; tti about 65ms, close to lead.
-    # Move one more step to 42 -> 22px / 400 = 55ms, should predict a jump.
-    frame = np.full((24, 120), 255, np.uint8)
-    paint_obstacle(frame, 42, 48, 0)
-    telemetry = d.process(frame, 1.07)
-    assert telemetry.predicted_tti_s is not None
-    assert telemetry.predicted_tti_s <= 0.060
-    assert telemetry.should_jump
+    assert jumped is not None
+    assert 300 <= jumped.speed_px_s <= 500
+    assert jumped.obstacle_exit_distance_px is not None
+    assert jumped.obstacle_exit_distance_px > jumped.obstacle_distance_px
+    assert jumped.predicted_exit_tti_dino_s is not None
+    assert jumped.landing_error_s is not None
+    assert jumped.landing_error_s >= 0.02
+    assert jumped.landing_error_s < 0.06
 
 
 def test_minor_noise_does_not_trigger():
@@ -96,29 +106,47 @@ def test_minor_noise_does_not_trigger():
     t = d.process(frame, 1.0)
     assert not t.should_jump
 
-def test_predictive_jump_does_not_rearm_before_same_obstacle_passes():
-    d = make_detector(bg=255, min_speed_px_s=100, max_speed_px_s=2000, lead_time_s=0.08)
 
-    # Teach about 400 px/s and get a predictive jump while still right of circle.
-    for x, t in [(65, 1.00), (57, 1.02), (49, 1.04)]:
+def test_predictive_jump_does_not_rearm_before_same_obstacle_passes_or_landing():
+    d = make_detector(
+        bg=255,
+        min_speed_px_s=100,
+        max_speed_px_s=2000,
+        jump_air_time_s=0.20,
+        landing_margin_s=0.02,
+    )
+
+    jumped_at = None
+    for x, t in [(90, 1.00), (82, 1.02), (74, 1.04), (66, 1.06), (58, 1.08), (50, 1.10)]:
         frame = np.full((24, 120), 255, np.uint8)
-        paint_obstacle(frame, x, x + 8, 0)
+        paint_obstacle(frame, x, x + 10, 0)
         result = d.process(frame, t)
-    assert result.should_jump
+        if result.should_jump:
+            jumped_at = t
+            break
+    assert jumped_at is not None
 
-    # Same cactus keeps moving into and across the circle. It must not trigger again.
-    for x, t in [(41, 1.06), (33, 1.08), (25, 1.10), (18, 1.12), (12, 1.14)]:
+    t = jumped_at + 0.02
+    for x in (42, 34, 26, 18, 10):
         frame = np.full((24, 120), 255, np.uint8)
-        paint_obstacle(frame, x, x + 8, 0)
+        paint_obstacle(frame, x, x + 10, 0)
         assert not d.process(frame, t).should_jump
+        t += 0.02
+
 
 def test_close_cactus_cluster_is_treated_as_one_hazard():
-    d = make_detector(bg=255, min_speed_px_s=100, max_speed_px_s=2000, lead_time_s=0.08)
+    d = make_detector(
+        bg=255,
+        min_speed_px_s=100,
+        max_speed_px_s=2000,
+        jump_air_time_s=0.22,
+        cluster_gap_time_s=0.10,
+        cluster_gap_fallback_px=35,
+    )
 
-    # Two blocks with only a tiny gap move together like a cactus cluster.
     jumped = 0
     t = 1.0
-    for lead_x in range(72, 4, -4):
+    for lead_x in range(100, -10, -4):
         frame = np.full((24, 120), 255, np.uint8)
         paint_obstacle(frame, lead_x, lead_x + 6, 0)
         paint_obstacle(frame, lead_x + 9, lead_x + 15, 0)
@@ -136,6 +164,5 @@ def test_calibration_raises_threshold_above_small_background_flicker():
     d.calibrate(frames)
     assert d.threshold >= 5
 
-    # A frame with only the same scale of flicker should not look like a cactus.
     frame = np.clip(128 + rng.integers(-4, 5, size=(20, 60)), 0, 255).astype(np.uint8)
     assert not d.process(frame, 1.0).should_jump
