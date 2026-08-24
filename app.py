@@ -17,9 +17,8 @@ def enable_dpi_awareness() -> str:
     except (AttributeError, OSError):
         pass
     try:
-        # This is the workaround recommended by pynput for Windows scaling.
         result = ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        if result in (0, -2147024891):  # S_OK or already configured
+        if result in (0, -2147024891):
             return "per-monitor"
     except (AttributeError, OSError):
         pass
@@ -31,7 +30,7 @@ def enable_dpi_awareness() -> str:
     return "unknown"
 
 
-DPI_MODE = enable_dpi_awareness()  # Must happen before Tk creates a window.
+DPI_MODE = enable_dpi_awareness()
 
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -53,12 +52,11 @@ class WinPoint(ctypes.Structure):
 
 
 def physical_cursor_pos(fallback_x: int, fallback_y: int) -> tuple[int, int]:
-    """Use physical coordinates even if Windows still applies DPI virtualization."""
     if sys.platform == "win32":
         try:
-            p = WinPoint()
-            if ctypes.windll.user32.GetPhysicalCursorPos(ctypes.byref(p)):
-                return int(p.x), int(p.y)
+            point = WinPoint()
+            if ctypes.windll.user32.GetPhysicalCursorPos(ctypes.byref(point)):
+                return int(point.x), int(point.y)
         except (AttributeError, OSError):
             pass
     return int(fallback_x), int(fallback_y)
@@ -66,7 +64,6 @@ def physical_cursor_pos(fallback_x: int, fallback_y: int) -> tuple[int, int]:
 
 class Marker:
     def __init__(self, root: tk.Tk, x: int, y: int, radius: int):
-        self.radius = radius
         size = radius * 2 + 18
         self.window = tk.Toplevel(root)
         self.window.overrideredirect(True)
@@ -93,7 +90,6 @@ class Marker:
             hwnd = self.window.winfo_id()
             user32 = ctypes.windll.user32
             style = user32.GetWindowLongW(hwnd, -20)
-            # Transparent + layered + toolwindow + no-activate.
             user32.SetWindowLongW(hwnd, -20, style | 0x20 | 0x80000 | 0x80 | 0x08000000)
         except Exception:
             pass
@@ -123,18 +119,19 @@ class PointSelector:
         self.overlay.configure(bg="black", cursor="crosshair")
 
         if sys.platform == "win32":
-            u = ctypes.windll.user32
-            vx, vy = u.GetSystemMetrics(76), u.GetSystemMetrics(77)
-            vw, vh = u.GetSystemMetrics(78), u.GetSystemMetrics(79)
+            user32 = ctypes.windll.user32
+            vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+            vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
         else:
             vx = vy = 0
             vw, vh = root.winfo_screenwidth(), root.winfo_screenheight()
+
         self.overlay.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
         self.overlay.bind("<Button-1>", self._clicked)
-        self.overlay.bind("<Escape>", lambda _e: self.cancel())
+        self.overlay.bind("<Escape>", lambda _event: self.cancel())
         tk.Label(
             self.overlay,
-            text="Click an EMPTY point in front of the dinosaur at cactus-body height\n(Esc to cancel)",
+            text="Click an EMPTY point roughly 100 px in front of the dinosaur, at cactus-body height\n(Esc to cancel)",
             fg="white",
             bg="black",
             font=("Segoe UI", 18, "bold"),
@@ -165,8 +162,8 @@ class DinoAutoPlayerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("530x440")
-        self.root.minsize(500, 420)
+        self.root.geometry("560x510")
+        self.root.minsize(530, 490)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.selected: tuple[int, int] | None = None
@@ -185,9 +182,12 @@ class DinoAutoPlayerApp:
         self.speed_var = tk.StringVar(value="—")
         self.jump_var = tk.StringVar(value="0")
         self.occupancy_var = tk.StringVar(value="—")
+        self.exit_var = tk.StringVar(value="—")
+
         self.lead_ms = tk.DoubleVar(value=70.0)
         self.radius = tk.IntVar(value=14)
         self.sensitivity = tk.DoubleVar(value=22.0)
+        self.marker_ahead_px = tk.IntVar(value=100)
 
         self._build_ui()
         self.root.after(50, self._poll_messages)
@@ -199,38 +199,42 @@ class DinoAutoPlayerApp:
             style.theme_use("vista")
         except tk.TclError:
             pass
+
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="Chrome Dino Auto-Player", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Select a blank point roughly 70–130 px in front of the dinosaur, at the middle of a cactus body. The app watches that physical screen location and predicts approaching obstacles.",
-            wraplength=490,
+            text="The detector now times jumps from the cactus EXIT (trailing edge), so the Dino lands just after the whole cactus/cluster clears.",
+            wraplength=520,
         ).pack(anchor="w", pady=(6, 15))
 
         info = ttk.LabelFrame(outer, text="Last telemetry", padding=12)
         info.pack(fill="x")
-        for row, (name, var) in enumerate((
+        rows = (
             ("Detector point", self.point_var),
             ("Estimated speed", self.speed_var),
             ("Circle contrast", self.occupancy_var),
+            ("Hazard exit", self.exit_var),
             ("Automatic jumps", self.jump_var),
-        )):
+        )
+        for row, (name, variable) in enumerate(rows):
             ttk.Label(info, text=name).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Label(info, textvariable=var, font=("Segoe UI", 10, "bold")).grid(row=row, column=1, sticky="e", pady=2)
+            ttk.Label(info, textvariable=variable, font=("Segoe UI", 10, "bold")).grid(row=row, column=1, sticky="e", pady=2)
         info.columnconfigure(1, weight=1)
 
         settings = ttk.LabelFrame(outer, text="Tuning", padding=12)
         settings.pack(fill="x", pady=12)
-        rows = (
-            ("Predictive lead (ms)", self.lead_ms, 25, 130),
+        setting_rows = (
+            ("Leading-edge safety (ms)", self.lead_ms, 25, 130),
+            ("Marker ahead of Dino (px)", self.marker_ahead_px, 60, 150),
             ("Circle radius", self.radius, 8, 24),
             ("Min contrast", self.sensitivity, 12, 55),
         )
-        for row, (name, var, low, high) in enumerate(rows):
+        for row, (name, variable, low, high) in enumerate(setting_rows):
             ttk.Label(settings, text=name).grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Scale(settings, from_=low, to=high, variable=var, orient="horizontal").grid(row=row, column=1, sticky="ew", padx=10, pady=3)
-            ttk.Label(settings, textvariable=var, width=7).grid(row=row, column=2, sticky="e")
+            ttk.Scale(settings, from_=low, to=high, variable=variable, orient="horizontal").grid(row=row, column=1, sticky="ew", padx=10, pady=3)
+            ttk.Label(settings, textvariable=variable, width=7).grid(row=row, column=2, sticky="e")
         settings.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(outer)
@@ -241,7 +245,13 @@ class DinoAutoPlayerApp:
         self.start_btn.pack(side="left", padx=8)
         self.stop_btn = ttk.Button(buttons, text="Stop (F8)", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left")
-        ttk.Label(outer, textvariable=self.status_var, wraplength=490).pack(anchor="w", pady=(12, 0))
+
+        ttk.Label(outer, textvariable=self.status_var, wraplength=520).pack(anchor="w", pady=(12, 0))
+        ttk.Label(
+            outer,
+            text="Tip: Marker ahead should roughly match how many pixels the cyan point is in front of the Dino. Default 100 px works well for the recommended placement.",
+            wraplength=520,
+        ).pack(anchor="w", pady=(7, 0))
 
     def select_point(self) -> None:
         if self.running:
@@ -271,6 +281,7 @@ class DinoAutoPlayerApp:
         if not self.selected:
             self.select_point()
             return
+
         self.jump_count = 0
         self.jump_var.set("0")
         self.stop_event.clear()
@@ -280,8 +291,6 @@ class DinoAutoPlayerApp:
         self.stop_btn.config(state="normal")
         self.status_var.set("Running… press F8 to stop.")
 
-        # Always hide our marker. Capture-exclusion APIs are not trusted here:
-        # a visible layered window can otherwise mask the cactus from GDI/MSS.
         self.root.withdraw()
         if self.marker:
             self.marker.hide()
@@ -290,6 +299,7 @@ class DinoAutoPlayerApp:
             "radius": int(self.radius.get()),
             "lead_ms": float(self.lead_ms.get()),
             "sensitivity": float(self.sensitivity.get()),
+            "marker_ahead_px": float(self.marker_ahead_px.get()),
         }
         threading.Thread(target=self._run_detector, args=(settings,), daemon=True).start()
 
@@ -312,11 +322,10 @@ class DinoAutoPlayerApp:
         x, y = self.selected
         radius = int(settings["radius"])
         behind = max(32, radius + 12)
-        lookahead = 240
+        lookahead = 600
         capture_h = max(48, radius * 2 + 18)
 
         try:
-            # Let withdrawn Tk windows disappear completely, then focus the game.
             time.sleep(0.18)
             self.mouse.position = (x, y)
             self.mouse.click(Button.left, 1)
@@ -327,6 +336,7 @@ class DinoAutoPlayerApp:
                 vleft, vtop = int(virtual["left"]), int(virtual["top"])
                 vright = vleft + int(virtual["width"])
                 vbottom = vtop + int(virtual["height"])
+
                 left = max(vleft, x - behind)
                 right = min(vright, x + lookahead)
                 top = max(vtop, y - capture_h // 2)
@@ -343,11 +353,12 @@ class DinoAutoPlayerApp:
                     behind_px=behind,
                     min_pixel_delta=float(settings["sensitivity"]),
                     lead_time_s=float(settings["lead_ms"]) / 1000.0,
+                    sensor_ahead_px=float(settings["marker_ahead_px"]),
                 )
                 detector = AutoJumpDetector(width, height, sensor_x, sensor_y, config)
+
                 print(
-                    f"[Dino] DPI={DPI_MODE}; physical point=({x},{y}); "
-                    f"capture=({left},{top},{width}x{height}); sensor=({sensor_x},{sensor_y})",
+                    f"[Dino] DPI={DPI_MODE}; physical point=({x},{y}); marker-ahead={config.sensor_ahead_px:.0f}px; capture=({left},{top},{width}x{height}); sensor=({sensor_x},{sensor_y})",
                     flush=True,
                 )
 
@@ -358,15 +369,13 @@ class DinoAutoPlayerApp:
                     time.sleep(0.012)
                 if self.stop_event.is_set():
                     return
+
                 detector.calibrate(frames)
                 print(
-                    f"[Dino] calibration: {len(frames)} frames, threshold={detector.threshold:.1f}, "
-                    f"noise={detector.noise_level:.2f}",
+                    f"[Dino] calibration: {len(frames)} frames, threshold={detector.threshold:.1f}, noise={detector.noise_level:.2f}",
                     flush=True,
                 )
 
-                # Start/restart the game. This initial press is not counted as an
-                # automatic cactus jump.
                 self.keyboard.press(keyboard.Key.space)
                 self.keyboard.release(keyboard.Key.space)
                 time.sleep(0.12)
@@ -375,18 +384,21 @@ class DinoAutoPlayerApp:
                 while not self.stop_event.is_set():
                     now = time.perf_counter()
                     telemetry = detector.process(self._grab_gray(sct, region), now)
+
                     if telemetry.should_jump:
                         self.keyboard.press(keyboard.Key.space)
                         self.keyboard.release(keyboard.Key.space)
                         self.jump_count += 1
+                        landing_ms = telemetry.landing_error_s * 1000.0 if telemetry.landing_error_s is not None else float("nan")
                         print(
-                            f"[Dino] JUMP #{self.jump_count}: distance={telemetry.obstacle_distance_px}, "
-                            f"speed={telemetry.speed_px_s:.0f}px/s, circle={telemetry.occupancy * 100:.1f}%",
+                            f"[Dino] JUMP #{self.jump_count}: entry={telemetry.obstacle_distance_px}, exit={telemetry.obstacle_exit_distance_px}, cluster={telemetry.cluster_width_px}, speed={telemetry.speed_px_s:.0f}px/s, land-after-exit={landing_ms:.0f}ms",
                             flush=True,
                         )
+
                     if now - last_ui >= 0.10:
-                        self.messages.put(("live", (telemetry.speed_px_s, telemetry.occupancy, self.jump_count)))
+                        self.messages.put(("live", (telemetry.speed_px_s, telemetry.occupancy, telemetry.obstacle_exit_distance_px, self.jump_count)))
                         last_ui = now
+
                     time.sleep(0.004)
         except Exception as exc:
             self.messages.put(("error", str(exc)))
@@ -412,9 +424,10 @@ class DinoAutoPlayerApp:
             while True:
                 kind, payload = self.messages.get_nowait()
                 if kind == "live":
-                    speed, occupancy, jumps = payload
+                    speed, occupancy, exit_distance, jumps = payload
                     self.speed_var.set(f"{float(speed):,.0f} px/s" if float(speed) > 0 else "learning…")
                     self.occupancy_var.set(f"{float(occupancy) * 100:.1f}%")
+                    self.exit_var.set(f"{float(exit_distance):.0f} px" if exit_distance is not None else "—")
                     self.jump_var.set(str(jumps))
                 elif kind == "error":
                     messagebox.showerror(APP_TITLE, f"Autoplay stopped:\n\n{payload}")
@@ -423,6 +436,7 @@ class DinoAutoPlayerApp:
                     self._restore()
         except queue.Empty:
             pass
+
         try:
             self.root.after(50, self._poll_messages)
         except tk.TclError:
