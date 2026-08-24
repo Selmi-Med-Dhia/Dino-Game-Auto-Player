@@ -163,7 +163,7 @@ class DinoAutoPlayerApp:
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
         self.root.geometry("560x510")
-        self.root.minsize(530, 490)
+        self.root.minsize(530, 690)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.selected: tuple[int, int] | None = None
