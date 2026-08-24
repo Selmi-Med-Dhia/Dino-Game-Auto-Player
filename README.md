@@ -1,45 +1,58 @@
 # Dino Auto-Player
 
-A small Windows Python app for Chrome's offline Dinosaur game. You choose one detector point on the screen. The app calibrates the local background, watches a circle plus a short look-ahead strip, estimates obstacle speed, and presses **Space** when an obstacle is about to reach the selected point.
+A Windows Python auto-player for Chrome's offline Dinosaur game. It captures a thin strip of the screen, learns the local background, tracks obstacle speed, groups nearby cacti, and presses **Space** at a time chosen to make the Dino land just after the complete hazard clears.
 
 ## Quick start
 
-1. Install **Python 3.11+** from python.org. On Windows, make sure the `py` launcher is installed.
-2. Open Chrome's Dinosaur game (`chrome://dino`) and leave it visible.
-3. Double-click **`run.bat`**.
-4. When the screen dims, click an **empty point a little in front of the dinosaur, around the middle height of a cactus**.
-5. A cyan circle marks the point. Click **Start autoplay**.
-6. The app briefly focuses the game, calibrates the clean background, then starts/restarts the game with Space.
-7. Press **F8** at any time to stop.
+1. Install Python 3.11+.
+2. Open `chrome://dino` in Chrome and leave the game visible.
+3. Double-click `run.bat`.
+4. Click an empty point roughly **100 px in front of the Dino**, around the middle of a cactus body.
+5. Click **Start autoplay**.
+6. Press **F8** to stop.
 
-## Choosing the point
+## How jump timing works
 
-Good placement matters more than any setting. Put the circle:
+The bot no longer times a jump only from the cactus's leading edge.
 
-- on empty background;
-- horizontally in front of the dinosaur;
-- high enough that the ground line is not inside the circle;
-- low enough that normal cacti cross it;
-- typically around 70-130 px in front of the dinosaur, depending on browser zoom.
+For every detected hazard it estimates:
 
-The predictor scans about 150 px to the **right** of this point and estimates right-to-left obstacle motion. Faster obstacles therefore trigger slightly earlier.
+- the **entry / leading edge**;
+- the **exit / trailing edge**;
+- the right-to-left screen speed;
+- the width of a close cactus cluster.
+
+Close cacti are merged into one hazard when their time gap is too short for a clean land-and-rejump. The planner then uses the **trailing edge of the last cactus in that cluster** and targets touchdown about 25 ms after it clears the Dino.
+
+A leading-edge safety deadline is still kept as a fallback for unusually wide hazards or late detections.
+
+## Why the jump model is about 440 ms
+
+The default air-time model is based on Chromium's normal T-Rex jump configuration: 60 FPS jump animation, gravity `0.6`, minimum/maximum jump height `30`, initial jump velocity around `-10`, and drop velocity `-5`. A normal tap is roughly 0.43–0.47 seconds airborne across the game's normal speed range, so the planner uses 0.44 seconds.
+
+## Back-to-back cacti
+
+The app does **not** re-arm merely because the detector circle becomes clear. That can fail when the next cactus reaches the detector before the Dino has landed.
+
+Instead, after a predictive jump it waits until the previous jump is expected to be essentially complete. A close following cactus is cleared in the same jump; a genuinely separate cactus can trigger a new Space immediately after touchdown.
+
+## Detection
+
+- Uses adaptive background subtraction, so both light and dark game themes work.
+- Scans a horizontal area rather than relying on one exact pixel.
+- Uses a roughly **600 px look-ahead band** so fast obstacles are seen early enough to position landing, not just avoid a collision at the last moment.
+- Uses physical Windows screen coordinates and enables DPI awareness to avoid 125%/150% display-scaling coordinate mismatches.
+- Hides the cyan marker during autoplay so the overlay cannot contaminate screen capture.
 
 ## Tuning
 
-- **Predictive lead** (default 60 ms): increase if jumps become late as the game speeds up; decrease if jumps are too early.
-- **Circle radius** (default 14 px): larger is easier to hit but more likely to see unrelated pixels.
-- **Min contrast** (default 26): increase if the app false-triggers on visual noise; decrease if a low-contrast theme is missed.
+- **Marker ahead of Dino (px)**: set this close to the actual horizontal distance between the Dino and your selected cyan point. Default: `100`.
+- **Leading-edge safety (ms)**: emergency latest-safe takeoff guard. Default: `70`.
+- **Circle radius**: detector-circle size. Default: `14`.
+- **Min contrast**: increase if visual noise causes detections; decrease if the cactus is not being seen. Default: `22`.
 
-## Why it handles light/dark modes
+## Tests
 
-It does not hard-code “black cactus.” During calibration it stores the local background image, then detects pixels whose absolute brightness difference from that background exceeds a threshold. A white obstacle on dark background and a dark obstacle on light background are both detected.
+The replay tests use cactus-like shapes, animated ground noise, light/dark themes, 120 Hz sampling, screen speeds from 300 to 1500 px/s, close cactus clusters, separate following cacti, and a discrete model of Chromium's current normal jump physics.
 
-## Multiple cacti
-
-A jump disarms the detector until the circle has genuinely cleared for a short interval. That prevents one wide cactus from causing repeated Space presses, while a later separate cactus can trigger a new jump after the gap.
-
-## Notes
-
-- Keep the game visible and unobstructed while it runs.
-- The cyan detector marker is excluded from screen capture on supported Windows builds. If Windows does not support that API, the marker automatically hides while autoplay is active so it cannot detect itself.
-- The app uses only screen capture and synthetic keyboard/mouse input; it does not modify Chrome or the game.
+The app uses only screen capture plus synthetic mouse/keyboard input; it does not modify Chrome or inject code into the game.
